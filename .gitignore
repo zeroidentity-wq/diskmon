@@ -1,0 +1,33 @@
+# IDEs/editors
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+*.bak
+*.tmp
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config
+config.yaml
+
+# Compiler
+compile.sh
+clean.sh
+/target/
+**/*.rs.bk
+Cargo.lock
+/builds/
+
+# dev
+install
+development.md
+publish.sh
+backup.sh
+releases/
+RELEASE.md
+TODO.md
