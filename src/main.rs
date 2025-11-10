@@ -353,7 +353,8 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
     };
 
     let mut body = format!(
-        "System Disk Report\n\n\
+        "<html><body><pre style=\"font-family: monospace;\">\n\
+         System Disk Report\n\n\
          Device: {} ({})\n\
          System: {} {}\n\
          Hostname: {}\n\
@@ -389,11 +390,6 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
         total_disks, threshold, low_space_disks, smart_failing_disks, unknown_smart_disks
     ));
 
-    // Add detailed disk information
-    body.push_str("Detailed Disk Information:\n");
-    body.push_str(&"=".repeat(50));
-    body.push_str("\n\n");
-
     // Add warnings for RAID and missing health info
     let mut no_health_info = false;
     let mut any_raid = false;
@@ -428,14 +424,14 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
         };
 
 body.push_str(&format!(
-    "Disk {}: {} {}\n\
-     - Mount Point: {}\n\
-     - File System: {}\n\
-     - Total Space: {:.2} GB\n\
-     - Used Space: {:.2} GB\n\
-     - Available Space: {:.2} GB\n\
-     - Free Space: {:.2}%\n\
-     - Health Check Method: {}\n",
+    "<b>Disk {}: {} {}</b>\n\
+     <b> - Mount Point:</b> {}\n\
+     <b> - File System:</b> {}\n\
+     <b> - Total Space:</b> {:.2} GB\n\
+     <b> - Used Space:</b> {:.2} GB\n\
+     <b> - Available Space:</b> {:.2} GB\n\
+     <b> - Free Space:</b> {:.2}%\n\
+     <b> - Health Check Method:</b> {}\n",
     i + 1,
     status_indicator,
     &disk.display_name,
@@ -510,39 +506,9 @@ body.push_str(&format!(
         body.push_str("\n");
     }
 
-    // Add recommendations if there are issues
-    let has_issues = low_space_disks > 0 || smart_failing_disks > 0;
-    if has_issues {
-        body.push_str("Recommendations:\n");
-        body.push_str(&"=".repeat(50));
-        body.push_str("\n");
-        
-        if low_space_disks > 0 {
-            body.push_str(&format!(
-                "- {} disk(s) have low space. Consider:\n\
-                 * Cleaning temporary files\n\
-                 * Removing unused applications\n\
-                 * Expanding storage capacity\n",
-                low_space_disks
-            ));
-        }
-        
-        if smart_failing_disks > 0 {
-            body.push_str(&format!(
-                "- {} disk(s) have SMART failures. Consider:\n\
-                 * Backing up important data immediately\n\
-                 * Replacing the failing disk(s)\n\
-                 * Monitoring disk health more frequently\n",
-                smart_failing_disks
-            ));
-        }
-        
-        body.push_str("\n");
-    }
+    // Add closing HTML tags
+    body.push_str("</pre></body></html>");
 
-    body.push_str("This is an automated report from DiskMon-Mail.\n");
-    body.push_str("For more information, visit: https://github.com/Monstertov/diskmon-mail");
-    
     // Build the email message; allow multiple recipients separated by commas in config.email_to
     let mut builder = Message::builder()
         .from(cfg.email_from.parse().map_err(|e| format!("Invalid sender email address: {e}"))?);
@@ -558,6 +524,9 @@ body.push_str(&format!(
 
     let email = builder
         .subject(subject)
+        .header(lettre::message::header::ContentType::TEXT_HTML)
+        .header(lettre::message::header::Header::new("X-Priority", "1"))
+        .header(lettre::message::header::Header::new("Importance", "high"))
         .body(body)
         .map_err(|e| format!("Failed to build email message: {e}"))?;
     
