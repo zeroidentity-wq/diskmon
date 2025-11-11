@@ -323,10 +323,10 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
     // Determine friendly name for this device (by hostname)
     let display_name = cfg.friendly_name.as_deref().unwrap_or(&system_info.hostname);
 
-    let subject = if forced {
-        format!("[FORCED] System Disk Report - {} ({})", display_name, format!("{} {} {}", system_info.os_name, system_info.os_version, system_info.architecture))
+    let mut subject = if forced {
+        format!("[RAPORT ZILNIC] System Disk Report - {} ({})", display_name, format!("{} {} {}", system_info.os_name, system_info.os_version, system_info.architecture))
     } else {
-        format!("System Disk Report - {} ({})", display_name, format!("{} {} {}", system_info.os_name, system_info.os_version, system_info.architecture))
+        format!("[ALARMĂ DEPĂSIRE PRAG DE STOCARE ] System Disk Report - {} ({})", display_name, format!("{} {} {}", system_info.os_name, system_info.os_version, system_info.architecture))
     };
     
     let os_info = format!("{} {} {}", system_info.os_name, system_info.os_version, system_info.architecture);
@@ -354,14 +354,14 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
 
     let mut body = format!(
         "<html><body><pre style=\"font-family: monospace;\">\n\
-         System Disk Report\n\n\
-         Device: {} ({})\n\
-         System: {} {}\n\
-         Hostname: {}\n\
-         Report Time: {}\n\
-         Mode: {}\n\
-         SMART Tools: {}\n\
-         Virtualization: {}\n\n",
+         <b>System Disk Report</b>\n\n\
+         <b>Device:</b> {} ({})\n\
+         <b>System:</b> {} {}\n\
+         <b>Hostname:</b> {}\n\
+         <b>Report Time:</b> {}\n\
+         <b>Mode:</b> {}\n\
+         <b>SMART Tools:</b> {}\n\
+         <b>Virtualization:</b> {}\n\n",
         display_name,
         system_info.hostname,
         os_info,
@@ -380,6 +380,21 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
         d.smart_status.as_deref().unwrap_or("OK").to_uppercase() != "OK"
     }).count();
     let unknown_smart_disks = disks.iter().filter(|d| d.smart_status.is_none()).count();
+
+    // If any disk is below threshold or SMART failing, mark this report as an alert
+    let alert_present = low_space_disks > 0 || smart_failing_disks > 0;
+    if alert_present {
+        // Prefix subject with a visible alert marker (emoji + label). Coloring the subject is not
+        // widely supported in mail clients, so we use an emoji and [ALERT] prefix instead.
+        subject = format!("🔴 [ALERT] {}", subject);
+        // Inject a visible red banner into the HTML body so it stands out in email clients.
+        // We insert the banner before the existing <pre> so the monospace report follows.
+        body = body.replacen(
+            "<html><body><pre",
+            "<html><body><h2 style=\"color:red; margin-bottom:6px\">ALERT: One or more disks require attention</h2><pre",
+            1,
+        );
+    }
 
     body.push_str(&format!(
         "Disk Summary:\n\
@@ -401,9 +416,7 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
             any_raid = true;
         }
     }
-    if no_health_info {
-        body.push_str("\nWARNING: No health information available for one or more disks. This tool should NOT be used for health monitoring tasks on these systems.\n");
-    }
+   
     if any_raid {
         body.push_str("\nWARNING: RAID device(s) detected. Health information may be unavailable or unreliable. This tool should NOT be used for health monitoring tasks on RAID systems.\n");
     }
@@ -413,14 +426,17 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
         let available_gb = disk.available_space as f64 / (1024.0 * 1024.0 * 1024.0);
         let used_gb = total_gb - available_gb;
         
+        // Use HTML-colored status indicators so the issue stands out in the HTML email body.
+        // Note: subject coloring is not reliably supported across mail clients, so we use an emoji
+        // prefix in the subject and color the body instead.
         let status_indicator = if disk.free_space_percent < threshold {
-            "[LOW SPACE]"
+            "<span style=\"color:red;font-weight:bold\">[LOW SPACE]</span>".to_string()
         } else if disk.smart_status.as_deref().unwrap_or("OK").to_uppercase() != "OK" {
-            "[SMART FAILING]"
+            "<span style=\"color:darkorange;font-weight:bold\">[SMART FAILING]</span>".to_string()
         } else if disk.reallocated_sectors.unwrap_or(0) > 0 || disk.pending_sectors.unwrap_or(0) > 0 || disk.uncorrectable_sectors.unwrap_or(0) > 0 || disk.temperature.unwrap_or(0) > 55 {
-            "[SMART WARNING]"
+            "<span style=\"color:orange;font-weight:bold\">[SMART WARNING]</span>".to_string()
         } else {
-            "[OK]"
+            "<span style=\"color:green;font-weight:bold\">[OK]</span>".to_string()
         };
 
 body.push_str(&format!(
@@ -444,15 +460,7 @@ body.push_str(&format!(
     disk.health_method
 ));
 
-        // Add SMART information
-        if let Some(status) = &disk.smart_status {
-            body.push_str(&format!(
-                " - SMART Status: {}\n",
-                status
-            ));
-        } else {
-            body.push_str(" - SMART Status: Unknown/N/A\n");
-        }
+
         if let Some(val) = disk.power_on_hours {
             body.push_str(&format!(" - Power On Hours: {}\n", val));
         }
@@ -492,9 +500,6 @@ body.push_str(&format!(
         }
         if disk.is_raid {
             body.push_str(" - RAID: Yes (SMART status may not be accurate)\n");
-        }
-        if disk.health_method != "smartmontools" && disk.health_method != "WMI" {
-            body.push_str("   * WARNING: Health info from fallback method; may be incomplete or unreliable.\n");
         }
         if disk.is_raid {
             body.push_str("   * WARNING: RAID device detected; health info may be unreliable.\n");
