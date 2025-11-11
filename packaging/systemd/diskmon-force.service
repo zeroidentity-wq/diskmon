@@ -1,0 +1,18 @@
+[Unit]
+Description=Diskmon forced run (one-shot) - sends --force-mail
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/etc/diskmon
+# Pass --force-mail to the wrapper (or to the binary directly)
+ExecStart=/usr/local/bin/diskmon-mail/diskmon-mail_v6 --force-mail
+StandardOutput=journal
+StandardError=journal
+Nice=10
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
