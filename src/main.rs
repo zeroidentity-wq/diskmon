@@ -525,8 +525,6 @@ body.push_str(&format!(
     let email = builder
         .subject(subject)
         .header(lettre::message::header::ContentType::TEXT_HTML)
-        .header(lettre::message::header::Header::new("X-Priority", "1"))
-        .header(lettre::message::header::Header::new("Importance", "high"))
         .body(body)
         .map_err(|e| format!("Failed to build email message: {e}"))?;
     
