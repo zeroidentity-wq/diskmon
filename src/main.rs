@@ -163,14 +163,15 @@ async fn get_monitored_disks(cfg: &config::Config, debug: bool, smart_timeout: u
                         if total == 0 { continue; }
                         let free_space_percent = (available as f64 / total as f64) * 100.0;
 
-                        let display_name = mount_point.clone();
+                        // Display name is mount point; for SMART, use the filesystem entry (which is typically the device, e.g. /dev/sda1)
+                        let display_name = format!("{} ({})", mount_point, filesystem);
 
                         // Respect excluded_disks config (match against mount point or filesystem)
                         let is_excluded = excluded.iter().enumerate().any(|(idx, ex)| {
                             let ex = ex.trim();
                             if ex.is_empty() { return false; }
                             let ex_up = ex.to_uppercase();
-                            let mount_up = display_name.to_uppercase();
+                            let mount_up = mount_point.to_uppercase();
                             let dev_up = filesystem.to_uppercase();
                             let found = mount_up.contains(&ex_up) || dev_up.contains(&ex_up);
                             if found { found_excluded[idx] = true; }
