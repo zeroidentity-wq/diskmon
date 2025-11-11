@@ -463,6 +463,10 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
             "<html><body><h2 style=\"color:red; margin-bottom:6px\">ALERT: One or more disks require attention</h2><pre",
             1,
         );
+    } else if forced {
+        // Forced report with no alerts: add a green marker to the subject so it's obvious
+        // that this was a forced/test run and no issues were detected.
+        subject = format!("🟢 {}", subject);
     }
 
     body.push_str(&format!(
