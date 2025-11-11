@@ -123,71 +123,139 @@ async fn get_monitored_disks(cfg: &config::Config, debug: bool, smart_timeout: u
         }
     }
 
-    for (_disk_idx, disk) in disks.list().iter().enumerate() {
-        let mount_point = match disk.mount_point().to_str() {
-            Some(path) => path.to_string(),
-            None => continue,
-        };
+    // On Unix systems prefer `df -T -P` parsing so we include all mount points that `df` shows
+    // (this captures bind mounts, LVM, etc. that sysinfo may not enumerate). If `df` isn't
+    // available or parsing fails, fall back to the sysinfo iteration below.
+    if cfg!(unix) {
+        if let Ok(output) = std::process::Command::new("df").arg("-T").arg("-P").output() {
+            if output.status.success() {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    // Skip header line and parse rows like:
+                    // Filesystem Type 1024-blocks Used Available Capacity Mounted on
+                    for (i, line) in text.lines().enumerate() {
+                        if i == 0 { continue; }
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() < 6 { continue; }
+                        // parts: [filesystem, fstype, size, used, avail, use%, mount]
+                        let filesystem = parts[0].to_string();
+                        let fstype = parts[1].to_string();
+                        let size_k = parts[2];
+                        let used_k = parts[3];
+                        let avail_k = parts[4];
+                        // mount point may be at index 5 but can contain spaces escaped as \040; df -P should keep mount as single token
+                        let mount_point = parts[5].to_string();
 
-        if cfg!(windows) {
-            if mount_point.starts_with("\\\\") || mount_point.starts_with("A:") || mount_point.starts_with("B:") {
-                continue;
-            }
-        } else {
-            if mount_point.starts_with("/media/") || mount_point.starts_with("/mnt/") || mount_point.starts_with("/run/media/") {
-                continue;
+                        // Exclude common pseudo filesystems
+                        let pseudo_fs = ["tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "overlay", "squashfs", "securityfs", "rpc_pipefs", "fusectl", "mqueue", "hugetlbfs"];
+                        if pseudo_fs.contains(&fstype.as_str()) {
+                            continue;
+                        }
+
+                        // Parse sizes (in 1K-blocks from df -P)
+                        let total = match size_k.parse::<u64>() {
+                            Ok(v) => v.saturating_mul(1024),
+                            Err(_) => continue,
+                        };
+                        let available = match avail_k.parse::<u64>() {
+                            Ok(v) => v.saturating_mul(1024),
+                            Err(_) => continue,
+                        };
+                        if total == 0 { continue; }
+                        let free_space_percent = (available as f64 / total as f64) * 100.0;
+
+                        let display_name = mount_point.clone();
+
+                        // Respect excluded_disks config (match against mount point or filesystem)
+                        let is_excluded = excluded.iter().enumerate().any(|(idx, ex)| {
+                            let ex = ex.trim();
+                            if ex.is_empty() { return false; }
+                            let ex_up = ex.to_uppercase();
+                            let mount_up = display_name.to_uppercase();
+                            let dev_up = filesystem.to_uppercase();
+                            let found = mount_up.contains(&ex_up) || dev_up.contains(&ex_up);
+                            if found { found_excluded[idx] = true; }
+                            found
+                        });
+                        if debug && is_excluded {
+                            debug!("Excluding disk (df): {} (display_name: {}, fs: {})", mount_point, display_name, filesystem);
+                        }
+                        if is_excluded { continue; }
+
+                        disk_candidates.push((mount_point, display_name, free_space_percent, total, available, fstype, filesystem));
+                    }
+                }
             }
         }
+    }
 
-        let total = disk.total_space();
-        let available = disk.available_space();
+    // If running on non-Unix or `df` parsing produced no candidates, fall back to sysinfo enumeration
+    if disk_candidates.is_empty() {
+        for (_disk_idx, disk) in disks.list().iter().enumerate() {
+            let mount_point = match disk.mount_point().to_str() {
+                Some(path) => path.to_string(),
+                None => continue,
+            };
 
-        if total == 0 {
-            continue;
-        }
+            if cfg!(windows) {
+                if mount_point.starts_with("\\\\") || mount_point.starts_with("A:") || mount_point.starts_with("B:") {
+                    continue;
+                }
+            } else {
+                if mount_point.starts_with("/media/") || mount_point.starts_with("/mnt/") || mount_point.starts_with("/run/media/") {
+                    continue;
+                }
+            }
 
-        let free_space_percent = (available as f64 / total as f64) * 100.0;
+            let total = disk.total_space();
+            let available = disk.available_space();
 
-        let display_name = if cfg!(windows) {
-            if mount_point.len() >= 2 && mount_point.chars().nth(1) == Some(':') {
-                format!("Drive {}", mount_point.chars().nth(0).unwrap().to_uppercase())
+            if total == 0 {
+                continue;
+            }
+
+            let free_space_percent = (available as f64 / total as f64) * 100.0;
+
+            let display_name = if cfg!(windows) {
+                if mount_point.len() >= 2 && mount_point.chars().nth(1) == Some(':') {
+                    format!("Drive {}", mount_point.chars().nth(0).unwrap().to_uppercase())
+                } else {
+                    mount_point.clone()
+                }
             } else {
                 mount_point.clone()
+            };
+
+            // Exclude disks if in excluded_disks
+            let is_excluded = if cfg!(windows) {
+                excluded.iter().enumerate().any(|(i, ex)| {
+                    let ex = ex.trim();
+                    if ex.is_empty() { return false; }
+                    let ex = ex.to_uppercase();
+                    let disp = display_name.to_uppercase();
+                    let found = disp.contains(&ex);
+                    if found { found_excluded[i] = true; }
+                    found
+                })
+            } else {
+                excluded.iter().enumerate().any(|(i, ex)| {
+                    let ex = ex.trim();
+                    if ex.is_empty() { return false; }
+                    let dev = disk.name().to_str().unwrap_or("");
+                    let found = dev == ex;
+                    if found { found_excluded[i] = true; }
+                    found
+                })
+            };
+            if debug && is_excluded {
+                debug!("Excluding disk: {} (display_name: {}, dev: {:?})", mount_point, display_name, disk.name());
             }
-        } else {
-            mount_point.clone()
-        };
+            if is_excluded { continue; }
 
-        // Exclude disks if in excluded_disks
-        let is_excluded = if cfg!(windows) {
-            excluded.iter().enumerate().any(|(i, ex)| {
-                let ex = ex.trim();
-                if ex.is_empty() { return false; }
-                let ex = ex.to_uppercase();
-                let disp = display_name.to_uppercase();
-                let found = disp.contains(&ex);
-                if found { found_excluded[i] = true; }
-                found
-            })
-        } else {
-            excluded.iter().enumerate().any(|(i, ex)| {
-                let ex = ex.trim();
-                if ex.is_empty() { return false; }
-                let dev = disk.name().to_str().unwrap_or("");
-                let found = dev == ex;
-                if found { found_excluded[i] = true; }
-                found
-            })
-        };
-        if debug && is_excluded {
-            debug!("Excluding disk: {} (display_name: {}, dev: {:?})", mount_point, display_name, disk.name());
+            let file_system = disk.file_system().to_str().unwrap_or("Unknown").to_string();
+
+            // Store disk information for parallel SMART collection
+            disk_candidates.push((mount_point, display_name, free_space_percent, total, available, file_system, disk.name().to_str().unwrap_or("").to_string()));
         }
-        if is_excluded { continue; }
-
-        let file_system = disk.file_system().to_str().unwrap_or("Unknown").to_string();
-
-        // Store disk information for parallel SMART collection
-        disk_candidates.push((mount_point, display_name, free_space_percent, total, available, file_system, disk.name().to_str().unwrap_or("").to_string()));
     }
 
     // Collect excluded disks that were not found
@@ -397,11 +465,11 @@ async fn send_system_report(cfg: &config::Config, disks: &[DiskInfo], system_inf
     }
 
     body.push_str(&format!(
-        "Disk Summary:\n\
-         - Total Disks: {}\n\
-         - Low Space (<{}%): {}\n\
-         - SMART Failing: {}\n\
-         - SMART Unknown: {}\n\n",
+        "<b>Disk Summary:\n\
+         - <b>Total Disks:</b> {}\n\
+         - <b>Low Space (<{}%):</b> {}\n\
+         - <b>SMART Failing:</b> {}\n\
+         - <b>SMART Unknown:</b> {}\n\n",
         total_disks, threshold, low_space_disks, smart_failing_disks, unknown_smart_disks
     ));
 
@@ -459,7 +527,6 @@ body.push_str(&format!(
     disk.free_space_percent,
     disk.health_method
 ));
-
 
         if let Some(val) = disk.power_on_hours {
             body.push_str(&format!(" - Power On Hours: {}\n", val));
@@ -762,9 +829,6 @@ async fn main() {
         if disk.is_raid {
             any_raid = true;
         }
-    }
-    if no_health_info {
-        println!("{}", "WARNING: No health information available for one or more disks. This tool should NOT be used for health monitoring tasks on these systems.".red().bold());
     }
     if any_raid {
         println!("{}", "WARNING: RAID device(s) detected. Health information may be unavailable or unreliable. This tool should NOT be used for health monitoring tasks on RAID systems.".red().bold());
