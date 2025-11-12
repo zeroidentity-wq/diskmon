@@ -123,50 +123,55 @@ async fn get_monitored_disks(cfg: &config::Config, debug: bool, smart_timeout: u
         }
     }
 
-    // On Unix systems prefer `df -T -P` parsing so we include all mount points that `df` shows
+    // On Unix systems prefer `df` parsing so we include all mount points that `df` shows
     // (this captures bind mounts, LVM, etc. that sysinfo may not enumerate). If `df` isn't
     // available or parsing fails, fall back to the sysinfo iteration below.
     if cfg!(unix) {
+        // Try df -T -P first (modern systems: Debian, Ubuntu, RHEL 8+, etc.)
+        let mut df_parsed = false;
         if let Ok(output) = std::process::Command::new("df").arg("-T").arg("-P").output() {
             if output.status.success() {
                 if let Ok(text) = String::from_utf8(output.stdout) {
-                    // Skip header line and parse rows like:
+                    if debug {
+                        debug!("Attempting to parse 'df -T -P' output");
+                    }
+                    // Parse df -T -P format:
                     // Filesystem Type 1024-blocks Used Available Capacity Mounted on
                     for (i, line) in text.lines().enumerate() {
-                        if i == 0 { continue; }
+                        if i == 0 { continue; } // Skip header
                         let parts: Vec<&str> = line.split_whitespace().collect();
                         if parts.len() < 6 { continue; }
-                        // parts: [filesystem, fstype, size, used, avail, use%, mount]
+                        
                         let filesystem = parts[0].to_string();
                         let fstype = parts[1].to_string();
                         let size_k = parts[2];
-                        let used_k = parts[3];
-                        let avail_k = parts[4];
-                        // mount point may be at index 5 but can contain spaces escaped as \040; df -P should keep mount as single token
-                        let mount_point = parts[5].to_string();
+                        let available_k = parts[4];
 
                         // Exclude common pseudo filesystems
-                        let pseudo_fs = ["tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "overlay", "squashfs", "securityfs", "rpc_pipefs", "fusectl", "mqueue", "hugetlbfs"];
+                        let pseudo_fs = ["tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "overlay", "squashfs", 
+                                       "securityfs", "rpc_pipefs", "fusectl", "mqueue", "hugetlbfs", "autofs", "binfmt_misc"];
                         if pseudo_fs.contains(&fstype.as_str()) {
                             continue;
                         }
 
-                        // Parse sizes (in 1K-blocks from df -P)
+                        // Parse sizes (in 1K-blocks)
                         let total = match size_k.parse::<u64>() {
                             Ok(v) => v.saturating_mul(1024),
                             Err(_) => continue,
                         };
-                        let available = match avail_k.parse::<u64>() {
+                        let available = match available_k.parse::<u64>() {
                             Ok(v) => v.saturating_mul(1024),
                             Err(_) => continue,
                         };
                         if total == 0 { continue; }
                         let free_space_percent = (available as f64 / total as f64) * 100.0;
 
-                        // Display name is mount point; for SMART, use the filesystem entry (which is typically the device, e.g. /dev/sda1)
+                        // Mount point is at index 5+ (collect remaining parts in case of spaces)
+                        let mount_point = parts[5..].join(" ");
+
                         let display_name = format!("{} ({})", mount_point, filesystem);
 
-                        // Respect excluded_disks config (match against mount point or filesystem)
+                        // Respect excluded_disks config
                         let is_excluded = excluded.iter().enumerate().any(|(idx, ex)| {
                             let ex = ex.trim();
                             if ex.is_empty() { return false; }
@@ -177,15 +182,96 @@ async fn get_monitored_disks(cfg: &config::Config, debug: bool, smart_timeout: u
                             if found { found_excluded[idx] = true; }
                             found
                         });
-                        if debug && is_excluded {
-                            debug!("Excluding disk (df): {} (display_name: {}, fs: {})", mount_point, display_name, filesystem);
-                        }
                         if is_excluded { continue; }
 
+                        if debug {
+                            debug!("[df -T -P] Added disk: {} (total={} bytes, available={} bytes, {}%)", 
+                                   display_name, total, available, free_space_percent);
+                        }
                         disk_candidates.push((mount_point, display_name, free_space_percent, total, available, fstype, filesystem));
+                        df_parsed = true;
                     }
                 }
             }
+        }
+
+        // Fallback to df -k for RHEL 7 and older systems that don't support df -T
+        if !df_parsed {
+            if let Ok(output) = std::process::Command::new("df").arg("-k").output() {
+                if output.status.success() {
+                    if let Ok(text) = String::from_utf8(output.stdout) {
+                        if debug {
+                            debug!("df -T -P failed or produced no results; attempting 'df -k' (RHEL 7 compatibility)");
+                        }
+                        // Parse df -k format:
+                        // Filesystem 1024-blocks Used Available Use% Mounted on
+                        for (i, line) in text.lines().enumerate() {
+                            if i == 0 { continue; } // Skip header
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.len() < 5 { continue; }
+                            
+                            let filesystem = parts[0].to_string();
+                            let size_k = parts[1];
+                            let available_k = parts[3];
+                            // Mount point is at index 4+ (collect remaining parts)
+                            let mount_point = parts[4..].join(" ");
+
+                            // Try to infer fstype from mount output (rough heuristic)
+                            let fstype = if mount_point == "/" || mount_point.starts_with("/boot") {
+                                "ext4".to_string() // Common root/boot filesystem
+                            } else if filesystem.starts_with("/dev/") {
+                                "ext4".to_string() // Assume ext4 for /dev/ entries
+                            } else {
+                                "unknown".to_string()
+                            };
+
+                            // Exclude pseudo filesystems by device/mount patterns
+                            if filesystem.starts_with("tmpfs") || filesystem.starts_with("devtmpfs") || 
+                               filesystem.starts_with("sysfs") || filesystem.starts_with("proc") ||
+                               filesystem.starts_with("cgroup") || mount_point.starts_with("/sys") ||
+                               mount_point.starts_with("/proc") || mount_point.starts_with("/dev") {
+                                continue;
+                            }
+
+                            let total = match size_k.parse::<u64>() {
+                                Ok(v) => v.saturating_mul(1024),
+                                Err(_) => continue,
+                            };
+                            let available = match available_k.parse::<u64>() {
+                                Ok(v) => v.saturating_mul(1024),
+                                Err(_) => continue,
+                            };
+                            if total == 0 { continue; }
+                            let free_space_percent = (available as f64 / total as f64) * 100.0;
+
+                            let display_name = format!("{} ({})", mount_point, filesystem);
+
+                            let is_excluded = excluded.iter().enumerate().any(|(idx, ex)| {
+                                let ex = ex.trim();
+                                if ex.is_empty() { return false; }
+                                let ex_up = ex.to_uppercase();
+                                let mount_up = mount_point.to_uppercase();
+                                let dev_up = filesystem.to_uppercase();
+                                let found = mount_up.contains(&ex_up) || dev_up.contains(&ex_up);
+                                if found { found_excluded[idx] = true; }
+                                found
+                            });
+                            if is_excluded { continue; }
+
+                            if debug {
+                                debug!("[df -k] Added disk: {} (total={} bytes, available={} bytes, {}%)", 
+                                       display_name, total, available, free_space_percent);
+                            }
+                            disk_candidates.push((mount_point, display_name, free_space_percent, total, available, fstype, filesystem));
+                            df_parsed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if debug && disk_candidates.is_empty() {
+            debug!("No disks detected via df parsing; will fall back to sysinfo enumeration");
         }
     }
 
